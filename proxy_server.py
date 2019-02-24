@@ -1,12 +1,14 @@
 import concurrent.futures
 import socket
+import traceback
 import urllib.parse
 
 from configs import config
 
 DEFAULT_HTTP_PORT = 80
-HTTP_LINEBREAK = '\r\n'
-DOUBLE_LINEBREAK = b'\r\n\r\n'
+DEFAULT_HTTPS_PORT = 443
+CR_LF = '\r\n'
+CONNECTION_ESTABLISHED = b'HTTP/1.1 200 Connection established\r\n\r\n'
 
 
 class Server:
@@ -20,14 +22,16 @@ class Server:
         # Re-use the socket
         self.listening_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
 
-        # bind the socket to a public host, and a port
+        # Bind the socket to a public host, and a port
         self.listening_socket.bind((config['HOST_NAME'], config['BIND_PORT']))
 
         self.listening_socket.listen(socket.SOMAXCONN)  # become a server socket
 
         self.__clients = set()
 
-        self.executor = concurrent.futures.ThreadPoolExecutor()
+        self.request_executor = concurrent.futures.ThreadPoolExecutor()
+
+        self.response_executor = concurrent.futures.ThreadPoolExecutor()
 
     def start(self):
         while True:
@@ -36,50 +40,74 @@ class Server:
 
             self.__clients.add(client_addr[0])
 
-            self.executor.submit(self.handle, client_conn, client_addr)
+            self.request_executor.submit(self.handle, client_conn, client_addr)
 
-    def handle(self, client_conn, client_addr):
+    def try_handle(self, client_conn, client_addr):
         url = None
 
         try:
-            first_chunk = client_conn.recv(self.buffer_length)
+            self.handle(client_conn, client_addr)
 
-            url = self.parse_url(first_chunk)
-
-            self.forward(url, first_chunk, client_conn, client_addr)
-
-        except Exception as e:
+        except:
             url_str = url.geturl() if url else None
-            print(url_str, e)
+            print(url_str)
+            traceback.print_exc()
 
-    def forward(self, url, first_chunk, client_conn, client_addr):
-        address = (url.hostname, url.port or DEFAULT_HTTP_PORT)
+    def handle(self, client_conn, client_addr):
+        request = client_conn.recv(self.buffer_length)
 
-        with socket.create_connection(address) as sock:
+        method, address = self.parse_method_and_address(request)
 
-            chunk = first_chunk
+        with socket.create_connection(address) as server_conn:
+            if method == 'CONNECT':
+                client_conn.sendall(CONNECTION_ESTABLISHED)
+                self.response_executor.submit(self.forward, server_conn, client_conn)
 
-            while True:
-                sock.sendall(chunk)
-                if chunk.endswith(DOUBLE_LINEBREAK):
-                    break
-                chunk = client_conn.recv(self.buffer_length)
+            else:
+                self.response_executor.submit(self.forward, server_conn, client_conn)
+                server_conn.sendall(request)
 
-            while True:
-                # receive data from web server
-                response = sock.recv(self.buffer_length)
-                if len(response) == 0:
-                    break
-                client_conn.sendall(response)  # send to browser/client
+            self.forward(client_conn, server_conn)
+
+    def forward(self, source, target):
+        while True:
+            # Receive data from source
+            response = source.recv(self.buffer_length)
+
+            if len(response) == 0:
+                break
+
+            # Forward to target
+            target.sendall(response)
 
     @staticmethod
-    def parse_url(first_chunk):
-        first_chunk_str = first_chunk.decode()
+    def parse_method_and_address(request):
+        method, url = Server.parse_method_and_url(request)
 
-        first_line = first_chunk_str[:first_chunk_str.index(HTTP_LINEBREAK)]
+        port = url.port or Server.get_default_port(url.scheme)
+        address = (url.hostname, port)
 
-        url_str = first_line.split(' ')[1]
+        return method, address
+
+    @staticmethod
+    def parse_method_and_url(request):
+        request_str = request.decode()
+
+        first_line = request_str[:request_str.index(CR_LF)]
+
+        method, url_str = first_line.split(' ')[:2]
+
+        if '://' not in url_str:
+            url_str = '//' + url_str
 
         url = urllib.parse.urlparse(url_str)
 
-        return url
+        return method, url
+
+    @staticmethod
+    def get_default_port(scheme):
+        if not scheme or scheme == 'http':
+            return DEFAULT_HTTP_PORT
+
+        if scheme == 'https':
+            return DEFAULT_HTTPS_PORT
