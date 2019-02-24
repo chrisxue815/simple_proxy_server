@@ -1,79 +1,85 @@
+import concurrent.futures
 import socket
-import threading
-import ssl
+import urllib.parse
 
 from configs import config
+
+DEFAULT_HTTP_PORT = 80
+HTTP_LINEBREAK = '\r\n'
+DOUBLE_LINEBREAK = b'\r\n\r\n'
 
 
 class Server:
 
     def __init__(self):
+        self.buffer_length = config['BUFFER_LENGTH']
 
         # Create a TCP socket
         self.listening_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
         # Re-use the socket
-        self.listening_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.listening_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
 
         # bind the socket to a public host, and a port
         self.listening_socket.bind((config['HOST_NAME'], config['BIND_PORT']))
 
-        self.listening_socket.listen(5)  # become a server socket
+        self.listening_socket.listen(socket.SOMAXCONN)  # become a server socket
+
         self.__clients = set()
+
+        self.executor = concurrent.futures.ThreadPoolExecutor()
 
     def start(self):
         while True:
             # Establish the connection
-            (client_socket, client_addr) = self.listening_socket.accept()
+            client_conn, client_addr = self.listening_socket.accept()
+
             self.__clients.add(client_addr[0])
 
-            t = threading.Thread(name=client_addr[1],
-                                 target=self.connect_client, args=(client_socket, client_addr))
-            t.start()
+            self.executor.submit(self.handle, client_conn, client_addr)
 
-    def connect_client(self, client_conn, client_addr):
-        data = client_conn.recv(config['MAX_REQUEST_LEN'])
+    def handle(self, client_conn, client_addr):
+        url = None
 
-        first_line = data.decode().split('\n')[0]
+        try:
+            first_chunk = client_conn.recv(self.buffer_length)
 
-        url = first_line.split(' ')[1]
+            url = self.parse_url(first_chunk)
 
-        http_pos = url.find("://")  # find pos of ://
+            self.forward(url, first_chunk, client_conn, client_addr)
 
-        tmp = url if http_pos == -1 else url[(http_pos + 3):]
+        except Exception as e:
+            url_str = url.geturl() if url else None
+            print(url_str, e)
 
-        port_pos = tmp.find(":")  # find the port pos (if any)
+    def forward(self, url, first_chunk, client_conn, client_addr):
+        address = (url.hostname, url.port or DEFAULT_HTTP_PORT)
 
-        # find end of web server
-        webserver_pos = tmp.find("/")
-        webserver_pos = len(tmp) if webserver_pos == -1 else webserver_pos
+        with socket.create_connection(address) as sock:
 
-        webserver = ""
-        port = -1
-        if port_pos == -1 or webserver_pos < port_pos:
-            # default port
-            port = 80
-            webserver = tmp[:webserver_pos]
+            chunk = first_chunk
 
-        else:  # specific port
-            port = int((tmp[(port_pos + 1):])[:webserver_pos - port_pos - 1])
-            webserver = tmp[:port_pos]
+            while True:
+                sock.sendall(chunk)
+                if chunk.endswith(DOUBLE_LINEBREAK):
+                    break
+                chunk = client_conn.recv(self.buffer_length)
 
-        self.request(webserver, port, data, client_conn, client_addr)
+            while True:
+                # receive data from web server
+                response = sock.recv(self.buffer_length)
+                if len(response) == 0:
+                    break
+                client_conn.sendall(response)  # send to browser/client
 
-    def request(self, webserver, port, data, client_conn, client_addr):
-        context = ssl.create_default_context()
-        with socket.create_connection((webserver, port)) as sock:
-            with context.wrap_socket(sock, server_hostname=webserver) as ssock:
-                ssock.sendall(data)
+    @staticmethod
+    def parse_url(first_chunk):
+        first_chunk_str = first_chunk.decode()
 
-                while True:
-                    # receive data from web server
-                    response = ssock.recv(config['MAX_REQUEST_LEN'])
+        first_line = first_chunk_str[:first_chunk_str.index(HTTP_LINEBREAK)]
 
-                    if len(response) > 0:
-                        client_conn.sendall(response)  # send to browser/client
-                    else:
-                        break
+        url_str = first_line.split(' ')[1]
 
-                ssock.shutdown(socket.SHUT_RDWR)
+        url = urllib.parse.urlparse(url_str)
+
+        return url
