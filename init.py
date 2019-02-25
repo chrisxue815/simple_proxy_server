@@ -2,7 +2,8 @@ import proxy_server
 
 
 def main():
-    proxy_server.Proxy().start()
+    with proxy_server.Proxy() as proxy:
+        proxy.serve_forever()
 
 
 if __name__ == '__main__':

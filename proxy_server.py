@@ -30,7 +30,10 @@ class Proxy:
 
         self.__clients = set()
 
-    def start(self):
+    def __del__(self):
+        del self.listening_socket
+
+    def serve_forever(self):
         while True:
             # Establish the connection
             client_conn, client_addr = self.listening_socket.accept()
